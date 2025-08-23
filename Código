@@ -1,0 +1,140 @@
+// Universidad del Valle de Guatemala
+// BE3029 - Electrónica Digital 2
+// Marcela Castañeda - 23717
+// Proyecto 1 - Sensor de temperatura
+// MCU: ESP32 dev kit 1.1
+
+// --------------- LIBRERÍAS --------------- // 
+#include <Arduino.h>
+#include <stdint.h>
+
+// --------------- DEFINICIONES --------------- //
+
+// Botón
+#define BTN 25
+
+// Sensor de temperatura
+#define SENSOR_TEMPERATURA 34
+
+// LEDs / Semáforo
+#define LED_V 23
+#define LED_A 22
+#define LED_R 15
+#define CH_V 0
+#define CH_A 1
+#define CH_R 2
+#define LED_FREQ 5000
+#define LED_RES 8 
+
+//Definición para el tiempo de antirrebote
+#define TiempoAntirrebote 200
+
+// ------------------------------ VARIABLES GLOBALES ----------------------------- //
+
+// Variables para implementación de antirrebote del botón 
+volatile bool BTN_Pressed = false;
+volatile uint32_t LastISR_BTN = 0;   // corregido: era bool, ahora uint32_t
+
+// Duty cycle para cada LED 
+volatile uint8_t dutyV = 0;
+volatile uint8_t dutyA = 0;
+volatile uint8_t dutyR = 0;
+
+// Lectura de temperatura 
+float valorsensor; // Variable para almacenar el valor que va a leer la temperatura (en voltaje)
+float temperatura; // Variable tipo float porque la temperatura va a tener decimal 
+
+// -------------------------------------------- PROTOTIPOS DE FUNCIONES --------------------------------------- // 
+// Funciones de inicialización
+void initPWM(); // Inicializar el PWM 
+void initBTN(); // Inicializar el botón para la lectura de temperatura 
+
+// Funciones de procesamiento
+void leerSensorTemperatura();
+void controlarSemaforo();
+
+// ISR del botón
+void IRAM_ATTR ISR_BTN(void);
+
+// --------------- CONFIGURACIÓN --------------- // 
+void setup() {
+  Serial.begin(115200); // Iniciar la comunicación serial
+
+  // Configuración del pin del sensor de temperatura
+  pinMode(SENSOR_TEMPERATURA, INPUT);
+
+  initBTN(); // Inicializar el botón
+  initPWM(); // Inicializar el PWM
+}
+
+// --------------- LOOP --------------- // 
+void loop() {
+  // Al presionar el botón se empieza con la función de lectura y control del semáforo
+  if (BTN_Pressed) {
+    leerSensorTemperatura();
+    controlarSemaforo();
+    BTN_Pressed = false;
+  }
+
+  delay(1000); // Esperar 1 segundo antes de la siguiente lectura
+}
+
+// --------------- DEFINICIÓN DE LAS FUNCIONES --------------- //
+
+// Definición del PWM para los LEDs / Semáforo
+void initPWM(void){
+  // Configurar canales PWM
+  ledcSetup(CH_V, LED_FREQ, LED_RES);
+  ledcSetup(CH_A, LED_FREQ, LED_RES);
+  ledcSetup(CH_R, LED_FREQ, LED_RES);
+
+  // Asignar pines a los canales
+  ledcAttachPin(LED_V, CH_V);
+  ledcAttachPin(LED_A, CH_A);
+  ledcAttachPin(LED_R, CH_R);
+
+  // Inicializar LEDs apagados
+  ledcWrite(CH_V, 0);
+  ledcWrite(CH_A, 0);
+  ledcWrite(CH_R, 0);
+}
+
+// Inicialización del botón con interrupción
+void initBTN(void) {
+  pinMode(BTN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BTN), ISR_BTN, FALLING);
+}
+
+// Lectura del sensor y conversión de la temperatura a grados Celsius
+void leerSensorTemperatura() {
+  valorsensor = analogRead(SENSOR_TEMPERATURA); // Leer el valor del sensor
+  temperatura = valorsensor * (3.3 / 4095.0) * 100.0; // Convertir la temperatura a °C
+  Serial.print("Temperatura: ");
+  Serial.println(temperatura);
+}
+
+// Control del semáforo según la temperatura
+void controlarSemaforo() {
+  if (temperatura < 22.0) {
+    ledcWrite(CH_V, 255); // encender LED verde
+    ledcWrite(CH_A, 0);
+    ledcWrite(CH_R, 0);
+  } else if (temperatura >= 22.0 && temperatura < 25.0) {
+    ledcWrite(CH_V, 0);
+    ledcWrite(CH_A, 255); // encender LED amarillo
+    ledcWrite(CH_R, 0);
+  } else {
+    ledcWrite(CH_V, 0);
+    ledcWrite(CH_A, 0);
+    ledcWrite(CH_R, 255); // encender LED rojo
+  }
+}
+
+// -------------------------------------------------- ISRs -------------------------------------------- //
+void IRAM_ATTR ISR_BTN(void){
+  uint32_t tiempoActual = millis();
+  if(tiempoActual - LastISR_BTN > TiempoAntirrebote){
+    BTN_Pressed = true; // Se presionó el botón
+    LastISR_BTN = tiempoActual;
+  }
+}

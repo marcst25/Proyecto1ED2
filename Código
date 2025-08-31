@@ -1,140 +1,265 @@
-// Universidad del Valle de Guatemala
-// BE3029 - Electrónica Digital 2
-// Marcela Castañeda - 23717
-// Proyecto 1 - Sensor de temperatura
-// MCU: ESP32 dev kit 1.1
+// Universidad del Valle de Guatemala 
+// BE3029 - Electrónica Digital 2 
+// Marcela Castañeda - 23717 
+// Proyecto 1 - Sensor de temperatura 
+// MCU: ESP32 dev kit 1.1 
 
-// --------------- LIBRERÍAS --------------- // 
-#include <Arduino.h>
-#include <stdint.h>
+// --------------- LIBRERÍAS --------------- //  
+#include <Arduino.h> 
+#include <stdint.h> 
+#include <Display7.h> //Librería creada para manejar el display de 7 segmentos
 
-// --------------- DEFINICIONES --------------- //
+// --------------- DEFINICIONES --------------- // 
 
-// Botón
-#define BTN 25
+// Botón 
+#define BTN 25 
 
-// Sensor de temperatura
-#define SENSOR_TEMPERATURA 34
+// Sensor de temperatura 
+#define SENSOR_TEMPERATURA 33 
 
-// LEDs / Semáforo
-#define LED_V 23
-#define LED_A 22
-#define LED_R 15
-#define CH_V 0
-#define CH_A 1
-#define CH_R 2
-#define LED_FREQ 5000
-#define LED_RES 8 
+// LEDs / Semáforo 
+#define LED_V 23 
+#define LED_A 22 
+#define LED_R 21 
+#define CH_V 0 
+#define CH_A 1 
+#define CH_R 2 
+#define LED_FREQ 5000 
+#define LED_RES 8  
 
-//Definición para el tiempo de antirrebote
-#define TiempoAntirrebote 200
+//Definición para el tiempo de antirrebote 
+#define TiempoAntirrebote 200 
 
-// ------------------------------ VARIABLES GLOBALES ----------------------------- //
+// Definiciones para el servo  
+#define SERVO_PIN 18 
+#define CH_SERVO 3 
+#define SERVO_FREQ 50 
+#define SERVO_RES 8   // resolución en bits (0–255) 
 
-// Variables para implementación de antirrebote del botón 
-volatile bool BTN_Pressed = false;
-volatile uint32_t LastISR_BTN = 0;   // corregido: era bool, ahora uint32_t
+#define Display1  12 //Display 1 (2 en el físico) 
+#define Display2  32 //Display 2 (3 en el físico) 
+#define Display3  2  //Display 3 (4 en el físico) 
 
-// Duty cycle para cada LED 
-volatile uint8_t dutyV = 0;
-volatile uint8_t dutyA = 0;
-volatile uint8_t dutyR = 0;
+// ------------------------------ VARIABLES GLOBALES ----------------------------- // 
 
-// Lectura de temperatura 
-float valorsensor; // Variable para almacenar el valor que va a leer la temperatura (en voltaje)
-float temperatura; // Variable tipo float porque la temperatura va a tener decimal 
+// Variables para implementación de antirrebote del botón  
+volatile bool BTN_Pressed = false; 
+volatile uint32_t LastISR_BTN = 0; 
 
-// -------------------------------------------- PROTOTIPOS DE FUNCIONES --------------------------------------- // 
-// Funciones de inicialización
-void initPWM(); // Inicializar el PWM 
-void initBTN(); // Inicializar el botón para la lectura de temperatura 
+// Duty cycle para cada LED  
+volatile uint8_t dutyV = 0; 
+volatile uint8_t dutyA = 0; 
+volatile uint8_t dutyR = 0; 
 
-// Funciones de procesamiento
-void leerSensorTemperatura();
-void controlarSemaforo();
+// Lectura de temperatura  
+float valorsensor;  
+float temperatura;  
+float temp; 
 
-// ISR del botón
-void IRAM_ATTR ISR_BTN(void);
+// Posiciones del servo en ms (PWM duty en milisegundos) 
+float posiciones_ms[] = {0.5, 1.5, 2.5};  
+// 0.5 ms ≈ 0°, 1.5 ms ≈ 90°, 2.5 ms ≈ 180° 
 
-// --------------- CONFIGURACIÓN --------------- // 
-void setup() {
-  Serial.begin(115200); // Iniciar la comunicación serial
+// Variables para multiplexación de displays
+volatile uint8_t centenas = 0, decenas = 0, unidades = 0;
+volatile int temp_x10 = 0;  // valor de temperatura * 10 para display
+const bool DIGIT_ACTIVE_LOW = true; // true es para displays activos en LOW
 
-  // Configuración del pin del sensor de temperatura
-  pinMode(SENSOR_TEMPERATURA, INPUT);
+// -------------------------------------------- PROTOTIPOS DE FUNCIONES --------------------------------------- //  
+void initPWM();  
+void initBTN();  
+void leerSensorTemperatura(); 
+void controlarSemaforo(); 
+void moverServoSegunTemperatura(); 
+void mostrarTemperaturaEnDisplay(float temperatura); 
+void IRAM_ATTR ISR_BTN(void); 
+void actualizarDigitos(int t10);
+void scanDisplays();
+void digitOn(uint8_t pin);
+void digitOff(uint8_t pin);
+void digitAllOff();
 
-  initBTN(); // Inicializar el botón
-  initPWM(); // Inicializar el PWM
+// --------------- CONFIGURACIÓN --------------- //  
+void setup() { 
+  Serial.begin(115200); 
+
+  // Configuración del pin del sensor de temperatura 
+  pinMode(SENSOR_TEMPERATURA, INPUT); 
+
+  // Pines de selección de display
+  pinMode(Display1, OUTPUT);
+  pinMode(Display2, OUTPUT);
+  pinMode(Display3, OUTPUT);
+  digitAllOff(); 
+
+  initBTN();  
+  initPWM();  
+  setupDisplay7(); 
+  configDisplay7(); 
+
+  // Setup para el servo 
+  ledcSetup(CH_SERVO, SERVO_FREQ, SERVO_RES); 
+  ledcAttachPin(SERVO_PIN, CH_SERVO); 
+  ledcWrite(CH_SERVO, 0); // servo apagado al inicio 
+} 
+
+// --------------- LOOP --------------- //  
+void loop() { 
+  scanDisplays(); // multiplexación
+
+  if (BTN_Pressed) { 
+    leerSensorTemperatura(); 
+    controlarSemaforo(); 
+    moverServoSegunTemperatura(); 
+    mostrarTemperaturaEnDisplay(temperatura); 
+    BTN_Pressed = false; 
+  } 
+} 
+
+// --------------- DEFINICIÓN DE LAS FUNCIONES --------------- // 
+
+void initPWM(void){ 
+  ledcSetup(CH_V, LED_FREQ, LED_RES); 
+  ledcSetup(CH_A, LED_FREQ, LED_RES); 
+  ledcSetup(CH_R, LED_FREQ, LED_RES); 
+
+  ledcAttachPin(LED_V, CH_V); 
+  ledcAttachPin(LED_A, CH_A); 
+  ledcAttachPin(LED_R, CH_R); 
+
+  ledcWrite(CH_V, 0); 
+  ledcWrite(CH_A, 0); 
+  ledcWrite(CH_R, 0); 
+} 
+
+void initBTN(void) { 
+  pinMode(BTN, INPUT_PULLUP); 
+  attachInterrupt(digitalPinToInterrupt(BTN), ISR_BTN, FALLING); 
+} 
+
+// ------- Función de conversión de temperatura ------- 
+void leerSensorTemperatura() { 
+  valorsensor = analogRead(SENSOR_TEMPERATURA);  
+
+  // Sensor a 5V
+  float t_cruda = valorsensor * (5.0 / 4095.0) * 100.0;
+
+  // Redondeo a 1 decimal
+  int t10 = (int)(t_cruda * 10.0f + 0.5f);
+
+  temp_x10 = t10;           
+  temperatura = t10 / 10.0f;  
+
+  Serial.print("Temperatura: "); 
+  Serial.print(temperatura, 1);  
+  Serial.println(" °C"); 
+  Serial.print("Valor bruto del sensor: "); 
+  Serial.println(valorsensor); 
+} 
+
+// ------- Función para controlar el semáforo ------- 
+void controlarSemaforo() { 
+  if (temperatura < 22.0) { 
+    ledcWrite(CH_V, 255);  
+    ledcWrite(CH_A, 0); 
+    ledcWrite(CH_R, 0); 
+  } else if (temperatura >= 22.0 && temperatura < 25.0) { 
+    ledcWrite(CH_V, 0); 
+    ledcWrite(CH_A, 255);  
+    ledcWrite(CH_R, 0); 
+  } else { 
+    ledcWrite(CH_V, 0); 
+    ledcWrite(CH_A, 0); 
+    ledcWrite(CH_R, 255);  
+  } 
+} 
+
+// -------- Función para mover el Servo -------- // 
+void moverServoSegunTemperatura() { 
+  float pulso_ms; 
+
+  if (temperatura < 22.0) { 
+    pulso_ms = posiciones_ms[0]; 
+  } else if (temperatura >= 22.0 && temperatura < 25.0) { 
+    pulso_ms = posiciones_ms[1]; 
+  } else { 
+    pulso_ms = posiciones_ms[2]; 
+  } 
+
+  int duty = (pulso_ms / 20.0) * (1 << SERVO_RES); 
+  ledcWrite(CH_SERVO, duty); 
+
+  Serial.print("Servo en: "); 
+  Serial.println(pulso_ms); 
+} 
+
+// ----- función para convertir la temperatura a decimal en el display 
+void mostrarTemperaturaEnDisplay(float temp) { 
+  actualizarDigitos(temp_x10);
+} 
+
+// -------------------------------------------------- ISRs -------------------------------------------- // 
+void IRAM_ATTR ISR_BTN(void){ 
+  uint32_t tiempoActual = millis(); 
+  if(tiempoActual - LastISR_BTN > TiempoAntirrebote){ 
+    BTN_Pressed = true;  
+    LastISR_BTN = tiempoActual; 
+  } 
+} 
+
+// Funciones helpers de multiplexaación para encender y apagar los dígitos 
+
+void digitOn(uint8_t pin)  { 
+  digitalWrite(pin, DIGIT_ACTIVE_LOW ? LOW  : HIGH); 
 }
 
-// --------------- LOOP --------------- // 
-void loop() {
-  // Al presionar el botón se empieza con la función de lectura y control del semáforo
-  if (BTN_Pressed) {
-    leerSensorTemperatura();
-    controlarSemaforo();
-    BTN_Pressed = false;
+void digitOff(uint8_t pin) { 
+  digitalWrite(pin, DIGIT_ACTIVE_LOW ? HIGH : LOW ); 
+}
+
+void digitAllOff(){ 
+  digitOff(Display1); digitOff(Display2); digitOff(Display3); 
+}
+
+void actualizarDigitos(int t10) {
+  if (t10 < 0)   t10 = 0;
+  if (t10 > 999) t10 = 999;  
+
+  unidades = t10 % 10;           
+  decenas = (t10 / 10) % 10;    
+  centenas = (t10 / 100) % 10;   
+}
+// función para encender los dígitos del display de forma cíclica
+void scanDisplays() {
+  static uint8_t indiceDisplay = 0;
+  static uint32_t last_us = 0;
+  uint32_t now = micros();
+
+  if (now - last_us < 2000) return;
+  last_us = now;
+
+  digitAllOff();
+
+  switch (indiceDisplay) {
+    case 0: { // display para centenas
+      desplegarNumero(centenas);
+      desplegarPunto(0);          
+      digitOn(Display1);
+      break;
+    }
+    case 1: { // display físico para decenas
+      desplegarNumero(decenas);
+      desplegarPunto(1); //Para este display se enciende el punto
+      digitOn(Display2);
+      break;
+    }
+    case 2: { // display físico para unidades
+      desplegarNumero(unidades); // Se muestra como decimal en el display
+      desplegarPunto(0);          
+      digitOn(Display3);
+      break;
+    }
   }
 
-  delay(1000); // Esperar 1 segundo antes de la siguiente lectura
-}
-
-// --------------- DEFINICIÓN DE LAS FUNCIONES --------------- //
-
-// Definición del PWM para los LEDs / Semáforo
-void initPWM(void){
-  // Configurar canales PWM
-  ledcSetup(CH_V, LED_FREQ, LED_RES);
-  ledcSetup(CH_A, LED_FREQ, LED_RES);
-  ledcSetup(CH_R, LED_FREQ, LED_RES);
-
-  // Asignar pines a los canales
-  ledcAttachPin(LED_V, CH_V);
-  ledcAttachPin(LED_A, CH_A);
-  ledcAttachPin(LED_R, CH_R);
-
-  // Inicializar LEDs apagados
-  ledcWrite(CH_V, 0);
-  ledcWrite(CH_A, 0);
-  ledcWrite(CH_R, 0);
-}
-
-// Inicialización del botón con interrupción
-void initBTN(void) {
-  pinMode(BTN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(BTN), ISR_BTN, FALLING);
-}
-
-// Lectura del sensor y conversión de la temperatura a grados Celsius
-void leerSensorTemperatura() {
-  valorsensor = analogRead(SENSOR_TEMPERATURA); // Leer el valor del sensor
-  temperatura = valorsensor * (3.3 / 4095.0) * 100.0; // Convertir la temperatura a °C
-  Serial.print("Temperatura: ");
-  Serial.println(temperatura);
-}
-
-// Control del semáforo según la temperatura
-void controlarSemaforo() {
-  if (temperatura < 22.0) {
-    ledcWrite(CH_V, 255); // encender LED verde
-    ledcWrite(CH_A, 0);
-    ledcWrite(CH_R, 0);
-  } else if (temperatura >= 22.0 && temperatura < 25.0) {
-    ledcWrite(CH_V, 0);
-    ledcWrite(CH_A, 255); // encender LED amarillo
-    ledcWrite(CH_R, 0);
-  } else {
-    ledcWrite(CH_V, 0);
-    ledcWrite(CH_A, 0);
-    ledcWrite(CH_R, 255); // encender LED rojo
-  }
-}
-
-// -------------------------------------------------- ISRs -------------------------------------------- //
-void IRAM_ATTR ISR_BTN(void){
-  uint32_t tiempoActual = millis();
-  if(tiempoActual - LastISR_BTN > TiempoAntirrebote){
-    BTN_Pressed = true; // Se presionó el botón
-    LastISR_BTN = tiempoActual;
-  }
+  indiceDisplay = (indiceDisplay + 1) % 3;
 }

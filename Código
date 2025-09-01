@@ -67,12 +67,12 @@ volatile uint8_t centenas = 0, decenas = 0, unidades = 0;
 volatile int temp_x10 = 0;  // valor de temperatura * 10 para display
 const bool DIGIT_ACTIVE_LOW = true; // true es para displays activos en LOW
 
-// AGREGADO: Timer de hardware para refresco de displays
+// Timer de hardware para refresco de displays
 hw_timer_t* timerMux = nullptr;
 portMUX_TYPE muxSpinlock = portMUX_INITIALIZER_UNLOCKED;
 volatile uint8_t indiceDisplayISR = 0;  // índice manejado en ISR
 
-// AGREGADO: variable para imprimir ángulo del servo en grados
+// variable para imprimir ángulo del servo en grados
 float servo_grados = 0.0;
 
 // -------------------------------------------- PROTOTIPOS DE FUNCIONES --------------------------------------- //  
@@ -89,7 +89,7 @@ void digitOn(uint8_t pin);
 void digitOff(uint8_t pin);
 void digitAllOff();
 
-// AGREGADO: prototipo de ISR del timer
+//prototipo de ISR del timer
 void IRAM_ATTR ISR_Multiplex();
 
 // ----------------- Adafruit IO -------------------- // 
@@ -130,20 +130,18 @@ void setup() {
   Serial.println(io.statusText());
 
   // Configurar timer a ~1 kHz total (1 ms)
-  // 80 MHz / 80 = 1 MHz (1 us por tick) -> 1000 us = 1 ms
+  // 80 MHz / 80 = 1 MHz
   timerMux = timerBegin(0, 80, true);
   timerAttachInterrupt(timerMux, &ISR_Multiplex, true);
-  timerAlarmWrite(timerMux, 1000, true); // 1000 us -> 1 kHz
+  timerAlarmWrite(timerMux, 1000, true); // 1000 us es 1 kHz
   timerAlarmEnable(timerMux);
 } 
 
 // --------------- LOOP --------------- //  
 void loop() { 
-  io.run();            // mantener la conexión MQTT/WiFi
+  io.run(); // mantener la conexión a Wifi
 
-  // Nota: el refresco del display ya NO ocurre aquí; lo hace el timer en ISR_Multiplex()
-
-  // ahora SOLO publica cuando presionas el botón
+  //ahora solo se publica cuando se presiona el botón 
   if (BTN_Pressed) { 
     leerSensorTemperatura(); 
     controlarSemaforo(); 
@@ -151,8 +149,7 @@ void loop() {
     mostrarTemperaturaEnDisplay(temperatura); 
 
     // Publicar en Adafruit IO cada vez que presionas el botón
-    // (AGREGADO: se elimina "sending ->")
-    tempCanal->save(temperatura);     // publicar solo temperatura
+    tempCanal->save(temperatura);//publicar solo temperatura
 
     BTN_Pressed = false; 
   } 

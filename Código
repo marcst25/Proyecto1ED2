@@ -8,6 +8,8 @@
 #include <Arduino.h> 
 #include <stdint.h> 
 #include <Display7.h> //Librería creada para manejar el display de 7 segmentos
+#include "AdafruitIO_WiFi.h"
+#include "config.h"
 
 // --------------- DEFINICIONES --------------- // 
 
@@ -58,12 +60,20 @@ float temp;
 
 // Posiciones del servo en ms (PWM duty en milisegundos) 
 float posiciones_ms[] = {0.5, 1.5, 2.5};  
-// 0.5 ms ≈ 0°, 1.5 ms ≈ 90°, 2.5 ms ≈ 180° 
+// 0.5 ms para 0°, 1.5 ms para 90°, 2.5 ms para 180° 
 
 // Variables para multiplexación de displays
 volatile uint8_t centenas = 0, decenas = 0, unidades = 0;
 volatile int temp_x10 = 0;  // valor de temperatura * 10 para display
 const bool DIGIT_ACTIVE_LOW = true; // true es para displays activos en LOW
+
+// AGREGADO: Timer de hardware para refresco de displays
+hw_timer_t* timerMux = nullptr;
+portMUX_TYPE muxSpinlock = portMUX_INITIALIZER_UNLOCKED;
+volatile uint8_t indiceDisplayISR = 0;  // índice manejado en ISR
+
+// AGREGADO: variable para imprimir ángulo del servo en grados
+float servo_grados = 0.0;
 
 // -------------------------------------------- PROTOTIPOS DE FUNCIONES --------------------------------------- //  
 void initPWM();  
@@ -78,6 +88,12 @@ void scanDisplays();
 void digitOn(uint8_t pin);
 void digitOff(uint8_t pin);
 void digitAllOff();
+
+// AGREGADO: prototipo de ISR del timer
+void IRAM_ATTR ISR_Multiplex();
+
+// ----------------- Adafruit IO -------------------- // 
+AdafruitIO_Feed *tempCanal = io.feed("temperatura-lm35");
 
 // --------------- CONFIGURACIÓN --------------- //  
 void setup() { 
@@ -101,17 +117,43 @@ void setup() {
   ledcSetup(CH_SERVO, SERVO_FREQ, SERVO_RES); 
   ledcAttachPin(SERVO_PIN, CH_SERVO); 
   ledcWrite(CH_SERVO, 0); // servo apagado al inicio 
+
+  // Conexión a Adafruit 
+  Serial.print("Connecting to Adafruit IO");
+  io.connect(); //Conectarse a adafruitio.com
+
+  while(io.status() < AIO_CONNECTED) { //Esperar la conexión
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();//Enviar mensaje de conexión 
+  Serial.println(io.statusText());
+
+  // Configurar timer a ~1 kHz total (1 ms)
+  // 80 MHz / 80 = 1 MHz (1 us por tick) -> 1000 us = 1 ms
+  timerMux = timerBegin(0, 80, true);
+  timerAttachInterrupt(timerMux, &ISR_Multiplex, true);
+  timerAlarmWrite(timerMux, 1000, true); // 1000 us -> 1 kHz
+  timerAlarmEnable(timerMux);
 } 
 
 // --------------- LOOP --------------- //  
 void loop() { 
-  scanDisplays(); // multiplexación
+  io.run();            // mantener la conexión MQTT/WiFi
 
+  // Nota: el refresco del display ya NO ocurre aquí; lo hace el timer en ISR_Multiplex()
+
+  // ahora SOLO publica cuando presionas el botón
   if (BTN_Pressed) { 
     leerSensorTemperatura(); 
     controlarSemaforo(); 
     moverServoSegunTemperatura(); 
     mostrarTemperaturaEnDisplay(temperatura); 
+
+    // Publicar en Adafruit IO cada vez que presionas el botón
+    // (AGREGADO: se elimina "sending ->")
+    tempCanal->save(temperatura);     // publicar solo temperatura
+
     BTN_Pressed = false; 
   } 
 } 
@@ -119,14 +161,17 @@ void loop() {
 // --------------- DEFINICIÓN DE LAS FUNCIONES --------------- // 
 
 void initPWM(void){ 
+  //Establecer la frecuencia y resolución para cada canal PWM de los leds
   ledcSetup(CH_V, LED_FREQ, LED_RES); 
   ledcSetup(CH_A, LED_FREQ, LED_RES); 
   ledcSetup(CH_R, LED_FREQ, LED_RES); 
 
+  //Asignar cada pin de led a su canal
   ledcAttachPin(LED_V, CH_V); 
   ledcAttachPin(LED_A, CH_A); 
   ledcAttachPin(LED_R, CH_R); 
 
+  //Apagar todos los leds cuando se inicia el programa
   ledcWrite(CH_V, 0); 
   ledcWrite(CH_A, 0); 
   ledcWrite(CH_R, 0); 
@@ -139,58 +184,96 @@ void initBTN(void) {
 
 // ------- Función de conversión de temperatura ------- 
 void leerSensorTemperatura() { 
-  valorsensor = analogRead(SENSOR_TEMPERATURA);  
+  //Pausar el multiplexado del display para evitar ruido en el ADC
+  if (timerMux) timerAlarmDisable(timerMux);
+  digitAllOff(); //Apagar todos los dígitos del display
 
-  // Sensor a 5V
-  float t_cruda = valorsensor * (5.0 / 4095.0) * 100.0;
+  //Definir los parámetros del filtrado
+  const int NUM_LEC = 32;//Realizar 32 lecturas para promediarlas
+  const double alpha = 0.1; //coeficiente alpha para el suavizado para filtro EMA
 
-  // Redondeo a 1 decimal
-  int t10 = (int)(t_cruda * 10.0f + 0.5f);
+  //Declarar las variables para calcular el promedio
+  uint32_t suma = 0;
+  uint16_t adcRaw = analogRead(SENSOR_TEMPERATURA); //lectura Raw del sensor de temperatura
+  suma += adcRaw; //Sumar la primera lectura
 
-  temp_x10 = t10;           
-  temperatura = t10 / 10.0f;  
+  // Ciclo for para leer las 32 muestras para luego promediar
+  for (int i = 1; i < NUM_LEC; i++) {
+    uint16_t v = analogRead(SENSOR_TEMPERATURA);
+    suma += v;
+    delay(1); } //tiempo corto entre lecturas 
+ 
+  double adcProm = (double)suma / (double)NUM_LEC; //Cálculo del promedio de las lecturas
 
-  Serial.print("Temperatura: "); 
-  Serial.print(temperatura, 1);  
-  Serial.println(" °C"); 
-  Serial.print("Valor bruto del sensor: "); 
-  Serial.println(valorsensor); 
-} 
+  //Aplicación del filtro EMA
+  static double adcEMA = 0.0;
+  static bool adcInit = false;
+  if (!adcInit) { 
+    adcEMA = adcProm;
+    adcInit = true; }//Después de calcular el primer promedio
+  else { //Aplicar filtro EMA para suavizar la señal
+    adcEMA = (alpha * adcProm) + ((1.0 - alpha) * adcEMA); }
+
+  digitAllOff(); // Apagar todos los dígitos mientras se lee el sensor
+  if (timerMux) timerAlarmEnable(timerMux); //Reanudar multiplexado
+  float t_cruda = (float)adcEMA * (5.0 / 4095.0) * 100.0; //Convertir el valor filtrado a temperatura en grados centígrados/celsius
+  int t10 = (int)(t_cruda * 10.0 + 0.5); //Rdondear la lectura a 1 decimal 
+
+  //Limitar valores extremos a 0–999 para solo mostrar 3 dígitos en el display
+  if (t10 < 0) t10 = 0;
+  if (t10 > 999) t10 = 999;
+
+  //Actualización de las variables globales
+  temp_x10 = t10; // temp*10, se usa para el display
+  temperatura = t10 / 10.0; //mostrar la temp en °C con 1 decimal
+
+  //Imprimir la temperatura en el monitor serial para verificar 
+  Serial.print(" | Temperatura: "); 
+  Serial.print(temperatura, 1);
+  Serial.println(" °C");
+}
 
 // ------- Función para controlar el semáforo ------- 
 void controlarSemaforo() { 
   if (temperatura < 22.0) { 
-    ledcWrite(CH_V, 255);  
+    ledcWrite(CH_V, 255); //Encender LED Verde
     ledcWrite(CH_A, 0); 
     ledcWrite(CH_R, 0); 
   } else if (temperatura >= 22.0 && temperatura < 25.0) { 
     ledcWrite(CH_V, 0); 
-    ledcWrite(CH_A, 255);  
+    ledcWrite(CH_A, 255);//Encender LED Amarillo
     ledcWrite(CH_R, 0); 
   } else { 
     ledcWrite(CH_V, 0); 
     ledcWrite(CH_A, 0); 
-    ledcWrite(CH_R, 255);  
+    ledcWrite(CH_R, 255);//Encender LED Rojo 
   } 
 } 
 
 // -------- Función para mover el Servo -------- // 
 void moverServoSegunTemperatura() { 
-  float pulso_ms; 
+  float pulso_ms; //Variable para almacenar el ancho de pulso en milisegundos
 
   if (temperatura < 22.0) { 
-    pulso_ms = posiciones_ms[0]; 
+    pulso_ms = posiciones_ms[0]; //Posición del servo para temperatura baja, escoge el primer índice
   } else if (temperatura >= 22.0 && temperatura < 25.0) { 
-    pulso_ms = posiciones_ms[1]; 
+    pulso_ms = posiciones_ms[1];//Para temperatura media, escoge el segundo índice
   } else { 
-    pulso_ms = posiciones_ms[2]; 
+    pulso_ms = posiciones_ms[2];//Para temperatura alta, escoge el tercer índice
   } 
 
-  int duty = (pulso_ms / 20.0) * (1 << SERVO_RES); 
-  ledcWrite(CH_SERVO, duty); 
+  int duty = (pulso_ms / 20.0) * (1 << SERVO_RES); //Calcular el valor del duty cycle
+  ledcWrite(CH_SERVO, duty);//Escribir el valor del duty cycle en el canal del servo
 
-  Serial.print("Servo en: "); 
-  Serial.println(pulso_ms); 
+  //Imprimir el ángulo del servo en grados
+  //Esto se realiza para verificar que el servo esté funcionando acorde a la temperatura leída 
+  servo_grados = (pulso_ms - 0.5) * 90.0; //(2.5-0.5)=2.0ms -> 180°, 1ms->90°, 0ms->0°
+  if (servo_grados < 0) servo_grados = 0;
+  if (servo_grados > 180) servo_grados = 180;
+
+  Serial.print("Servo en: ");
+  Serial.print(servo_grados, 0);//Imprimir el ángulo del servo en grados 
+  Serial.println(" grados");
 } 
 
 // ----- función para convertir la temperatura a decimal en el display 
@@ -199,6 +282,7 @@ void mostrarTemperaturaEnDisplay(float temp) {
 } 
 
 // -------------------------------------------------- ISRs -------------------------------------------- // 
+//ISR del botón
 void IRAM_ATTR ISR_BTN(void){ 
   uint32_t tiempoActual = millis(); 
   if(tiempoActual - LastISR_BTN > TiempoAntirrebote){ 
@@ -207,59 +291,61 @@ void IRAM_ATTR ISR_BTN(void){
   } 
 } 
 
-// Funciones helpers de multiplexaación para encender y apagar los dígitos 
-
-void digitOn(uint8_t pin)  { 
-  digitalWrite(pin, DIGIT_ACTIVE_LOW ? LOW  : HIGH); 
+//ISR del timer que refresca los displays
+void IRAM_ATTR ISR_Multiplex() {
+  portENTER_CRITICAL_ISR(&muxSpinlock);
+  scanDisplays();
+  portEXIT_CRITICAL_ISR(&muxSpinlock);
 }
 
-void digitOff(uint8_t pin) { 
-  digitalWrite(pin, DIGIT_ACTIVE_LOW ? HIGH : LOW ); 
-}
+//Funciones auxiliares de multiplexaación para encender y apagar los dígitos 
+void digitOn(uint8_t pin)  { //Enciende un dígito
+  digitalWrite(pin, DIGIT_ACTIVE_LOW ? LOW  : HIGH);}
 
-void digitAllOff(){ 
-  digitOff(Display1); digitOff(Display2); digitOff(Display3); 
-}
+void digitOff(uint8_t pin) {//Apaga un dígito
+  digitalWrite(pin, DIGIT_ACTIVE_LOW ? HIGH : LOW ); }
 
+void digitAllOff(){//Apaga todos los dígitos
+  digitOff(Display1); digitOff(Display2); digitOff(Display3);}
+
+//Función para actualizar las variables globales de los dígitos del display
 void actualizarDigitos(int t10) {
   if (t10 < 0)   t10 = 0;
-  if (t10 > 999) t10 = 999;  
+  if (t10 > 999) t10 = 999;//Limitar a 3 dígitos
 
-  unidades = t10 % 10;           
-  decenas = (t10 / 10) % 10;    
-  centenas = (t10 / 100) % 10;   
+  unidades = t10 % 10;//Obtener el dígito de las unidades
+  decenas = (t10 / 10) % 10; //Obtener el dígito de las decenas
+  centenas = (t10 / 100) % 10;//Obtener el dígito de las centenas
 }
+
 // función para encender los dígitos del display de forma cíclica
 void scanDisplays() {
-  static uint8_t indiceDisplay = 0;
-  static uint32_t last_us = 0;
-  uint32_t now = micros();
-
-  if (now - last_us < 2000) return;
-  last_us = now;
-
+  //Se apagan todos los dígitos antes de encender el correspondiente
   digitAllOff();
-
-  switch (indiceDisplay) {
-    case 0: { // display para centenas
+  //Switch-case para encender el dígito correspondiente
+  switch (indiceDisplayISR) { //utilizar el índice ISR para saber qué dígito encender
+    case 0: { //caso para centenas
       desplegarNumero(centenas);
       desplegarPunto(0);          
       digitOn(Display1);
       break;
     }
-    case 1: { // display físico para decenas
+    case 1: { //caso físico para decenas
       desplegarNumero(decenas);
       desplegarPunto(1); //Para este display se enciende el punto
       digitOn(Display2);
       break;
     }
-    case 2: { // display físico para unidades
+    case 2: { //caso físico para unidades
       desplegarNumero(unidades); // Se muestra como decimal en el display
       desplegarPunto(0);          
       digitOn(Display3);
       break;
     }
   }
-
-  indiceDisplay = (indiceDisplay + 1) % 3;
+  indiceDisplayISR = (indiceDisplayISR + 1) % 3; //cambiar y actualizar el índice del display a la siguiente posición
 }
+
+
+// ---------------------------------------------------------------------------------------------------------
+
